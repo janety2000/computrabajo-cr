@@ -1,0 +1,80 @@
+name: Computrabajo Colombia Scraper
+
+on:
+  workflow_dispatch: {}        # lets you trigger a run manually from the Actions tab
+  schedule:
+    # Runs every 15 minutes. Because of the concurrency group below, a new
+    # scheduled trigger that fires while a run is still in progress gets
+    # QUEUED (not dropped, not cancelled) — so the very next run starts the
+    # instant the current one ends, giving you continuous back-to-back runs
+    # without needing a self-retriggering token. Once every location has
+    # been scraped, the script exits almost instantly (it sees
+    # SCRAPE_COMPLETE.flag and returns), so these scheduled ticks become a
+    # harmless no-op that costs a few seconds of Actions minutes.
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: computrabajo-scraper
+  cancel-in-progress: false    # never kill a run in progress — queue behind it instead
+
+permissions:
+  contents: write               # needed to commit processed.csv / progress.json back to the repo
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # GitHub hard-kills a job at 360 minutes with no chance to save state, so
+    # this must stay comfortably under that. The script's own internal
+    # MAX_RUNTIME_SECONDS (below) stops it gracefully well before this fires.
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, so the rebase-before-push step below never fails on a shallow clone
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper (self-limiting runtime)
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME: ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          # 20000s = ~5h33m. Leaves ~15+ min of headroom inside the 350-min
+          # job timeout for checkout/setup/install (~1-2 min) and the commit
+          # step below, so the script always has time to save progress and
+          # exit cleanly on its own before GitHub would kill it mid-request.
+          MAX_RUNTIME_SECONDS: "20000"
+        run: python computrabajo_co_scraper.py
+
+      - name: Commit progress back to the repo
+        if: always()   # commit whatever progress was made even if the run errored out
+        run: |
+          git config user.name "computrabajo-scraper-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A -- processed.csv computrabajo_progress.json scraped_jobs.csv debug.log SCRAPE_COMPLETE.flag
+          if git diff --cached --quiet; then
+            echo "No progress changes to commit."
+          else
+            git commit -m "Scraper progress update [skip ci]"
+            git pull --rebase --autostash
+            git push
+          fi
+
+      - name: Report status
+        if: always()
+        run: |
+          if [ -f SCRAPE_COMPLETE.flag ]; then
+            echo "✅ All locations fully scraped. Future scheduled runs will exit instantly until the flag file is deleted."
+            cat SCRAPE_COMPLETE.flag
+          else
+            echo "⏱ Time budget reached (or run ended) before finishing all locations."
+            echo "The next scheduled run (within ~15 min) will resume automatically from computrabajo_progress.json."
+          fi
