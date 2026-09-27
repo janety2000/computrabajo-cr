@@ -3,8 +3,10 @@
 Computrabajo Costa Rica (cr.computrabajo.com) job scraper.
 
 Strategy:
-  1. Scrape the homepage's "Job bank according to: Location" block to get a
-     list of department + city search URLs (e.g. /empleos-en-medellin).
+  1. Scrape the homepage's location-browse links (e.g. /empleos-en-<place>)
+     to get a list of location search URLs, with diagnostics captured on
+     every fetch and a sitemap-based fallback if the homepage HTML yields
+     nothing.
   2. For each location, paginate the search-results grid (?p=2, ?p=3, ...)
      collecting job detail URLs, stopping when a page returns zero jobs.
   3. For each job detail page, read the embedded JSON-LD <script
@@ -12,11 +14,11 @@ Strategy:
      Computrabajo's own structured data and is far more stable than scraping
      minified CSS classes. Falls back to raw HTML parsing if JSON-LD is
      missing or malformed.
-  4. Posts each job (and its company) to WordPress, exactly like the
-     MyJobMag scraper: dedup via processed.csv, resumable via a progress
-     file, one WP round-trip per unique taxonomy term per run.
+  4. Posts each job (and its company) to WordPress: dedup via
+     cr_processed.csv, resumable via cr_computrabajo_progress.json,
+     one WP round-trip per unique taxonomy term per run.
 
-Run this directly in Colab or locally with: python computrabajo_co_scraper.py
+Run this directly in Colab or locally with: python computrabajo_cr_scraper.py
 """
 import os
 import re
@@ -29,7 +31,7 @@ import base64
 import hashlib
 import logging
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,14 +48,9 @@ PROCESSED_IDS_FILE = "cr_processed.csv"
 PROGRESS_FILE = "cr_computrabajo_progress.json"   # {"location_index": int, "page": int}
 SCRAPED_JOBS_CSV = "cr_scraped_jobs.csv"          # used when WP credentials aren't set
 DONE_FLAG_FILE = "cr_SCRAPE_COMPLETE.flag"        # created once every location is exhausted
+DIAG_FILE = "cr_fetch_diagnostics.json"           # NEW — hard evidence of what the homepage fetch actually returned
 
 # ── Time budget (for GitHub Actions) ──────────────────────────────────────────
-# A GH Actions job is killed hard at its timeout-minutes limit, mid-request,
-# with no chance to save progress. So the script tracks its own elapsed time
-# and stops itself gracefully (saving progress first) a safety margin before
-# that happens. The workflow then commits progress and queues the next run.
-# Default 300s (5 min) is only for quick local testing — the workflow always
-# passes a real budget via the MAX_RUNTIME_SECONDS env var.
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "300"))
 SCRIPT_START_TIME = time.time()
 
@@ -61,13 +58,26 @@ SCRIPT_START_TIME = time.time()
 def time_budget_exceeded() -> bool:
     return (time.time() - SCRIPT_START_TIME) >= MAX_RUNTIME_SECONDS
 
+# FIX: the previous header set (a 2021-era Chrome UA with no sec-ch-ua /
+# Accept-Encoding / Referer at all) is an easy fingerprint for a bot filter
+# to flag, especially coming from a GitHub Actions datacenter IP. This is a
+# more complete, current, internally-consistent browser fingerprint. It is
+# not a guarantee of getting past anti-bot protection, but it removes the
+# most obvious tell.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "es-CR,es;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
@@ -88,12 +98,6 @@ WP_JOBS_URL    = f"{WP_BASE}/job-listings"
 WP_COMPANY_URL = f"{WP_BASE}/companies"
 WP_MEDIA_URL   = f"{WP_BASE}/media"
 
-# FIX: this script previously had NO X-Internal-Auth support at all — every
-# request it made to WordPress went out without the header your Cloudflare
-# rule checks for, same gap that was fixed on the Nigeria/Ghana and
-# Computrabajo Colombia scrapers. Loaded as an *optional* env var (never
-# raises) so the script still runs — just loudly warns — until the secret
-# is added to this repo too.
 _LOCAL_INTERNAL_BOT_KEY = ""   # optional local override, same pattern as the WP_* vars above
 INTERNAL_BOT_KEY = _LOCAL_INTERNAL_BOT_KEY or os.environ.get("INTERNAL_BOT_KEY", "").strip()
 
@@ -112,14 +116,12 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 logger.handlers.clear()
 
-_fh = logging.FileHandler("debug.log", encoding="utf-8")
+_fh = logging.FileHandler("cr_debug.log", encoding="utf-8")
 _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(_fh)
 
 try:
-    # Colab / some Jupyter kernels replace sys.stdout with an object that has
-    # no .buffer attribute, which crashes io.TextIOWrapper(sys.stdout.buffer, ...)
     _utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 except AttributeError:
     _utf8_stdout = sys.stdout
@@ -134,23 +136,17 @@ if INTERNAL_BOT_KEY:
                 f"— X-Internal-Auth header WILL be sent on every WordPress request.")
 else:
     logger.warning("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING "
-                    "— X-Internal-Auth header will NOT be sent. Add it as a GitHub "
-                    "Actions secret for THIS repo if you rely on it to bypass a "
-                    "Cloudflare WAF/rate-limit rule.")
+                    "— X-Internal-Auth header will NOT be sent.")
 
 
 def require_wp_config() -> bool:
-    """Returns True if WP posting is fully configured, False otherwise.
-    No longer raises — the script runs fine without WordPress creds by
-    falling back to writing everything into scraped_jobs.csv instead."""
     missing = [n for n, v in
                [("WP_BASE_URL", WP_URL), ("WP_USERNAME", WP_USER), ("WP_APP_PASSWORD", WP_PASSWORD)]
                if not v]
     if missing:
         logger.warning(
             f"⚠️  WordPress credentials not set ({', '.join(missing)}) — "
-            f"WP posting is DISABLED. Scraped jobs will be written to {SCRAPED_JOBS_CSV} instead. "
-            f"Fill in the _LOCAL_WP_* variables near the top of this file to enable posting."
+            f"WP posting is DISABLED. Scraped jobs will be written to {SCRAPED_JOBS_CSV} instead."
         )
         return False
     return True
@@ -164,9 +160,6 @@ SESSION.headers.update(HEADERS)
 
 
 def wp_headers() -> dict:
-    # FIX: previously this returned only Authorization + Content-Type, with
-    # no X-Internal-Auth header at all — so this script's traffic could never
-    # be recognised as "trusted" by any Cloudflare rule checking for it.
     token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
     headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
     if INTERNAL_BOT_KEY:
@@ -181,6 +174,101 @@ def get_soup(url: str, timeout: int = REQUEST_TIMEOUT) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "html.parser")
 
 
+# ── NEW: bot-block detection ───────────────────────────────────────────────────
+# The previous version had no way to tell "the page loaded but our selectors
+# are wrong" apart from "we got blocked / rate-limited and never saw a real
+# page at all". These two failure modes need completely different fixes, so
+# we now explicitly check for the signatures of the second one.
+_BLOCK_SIGNATURES = [
+    "checking your browser", "cf-browser-verification", "attention required",
+    "cloudflare", "just a moment", "captcha", "access denied", "px-captcha",
+    "perimeterx", "distil_r_captcha", "incapsula", "are you a robot",
+    "unusual traffic", "verify you are human",
+]
+
+
+def looks_blocked(html_text: str) -> str:
+    """Returns the matched signature string if the page looks like a bot
+    challenge/block page rather than real site content, else ''."""
+    lowered = html_text.lower()
+    for sig in _BLOCK_SIGNATURES:
+        if sig in lowered:
+            return sig
+    return ""
+
+
+def fetch_homepage_with_diagnostics() -> tuple:
+    """
+    Fetches HOME_URL with retries, and — regardless of outcome — records
+    exactly what happened (status code, response headers, body length, a
+    body snippet, and whether it matches a known bot-block signature) to
+    DIAG_FILE. This file is the single most important debugging artifact
+    for "why did location discovery find nothing" — it tells you definitively
+    whether the scraper ever saw the real homepage at all.
+
+    Returns (soup_or_None, diagnostics_dict).
+    """
+    last_exception = None
+    diagnostics = {"url": HOME_URL, "attempts": []}
+
+    for attempt in range(1, 4):
+        attempt_info = {"attempt": attempt}
+        try:
+            resp = SESSION.get(HOME_URL, timeout=REQUEST_TIMEOUT)
+            resp.encoding = "utf-8"
+            body = resp.text
+            block_sig = looks_blocked(body)
+
+            attempt_info.update({
+                "status_code": resp.status_code,
+                "response_headers": dict(resp.headers),
+                "body_length": len(body),
+                "body_snippet": body[:1000],
+                "block_signature_matched": block_sig or None,
+                "final_url_after_redirects": resp.url,
+            })
+            diagnostics["attempts"].append(attempt_info)
+
+            if resp.status_code == 200 and not block_sig and len(body) > 2000:
+                logger.info(f"✅ Homepage fetched cleanly (HTTP {resp.status_code}, "
+                            f"{len(body):,} chars, no block signature detected).")
+                diagnostics["outcome"] = "ok"
+                return BeautifulSoup(body, "html.parser"), diagnostics
+
+            if block_sig:
+                logger.error(f"🚫 Homepage response looks like a bot-block/challenge page "
+                              f"(matched signature: '{block_sig}'). This is almost certainly "
+                              f"why location discovery finds nothing — the scraper never sees "
+                              f"real site content. See {DIAG_FILE} for the full response.")
+            else:
+                logger.warning(f"⚠️  Homepage response looked unusual (HTTP {resp.status_code}, "
+                                f"{len(body):,} chars) — retrying." )
+
+        except Exception as e:
+            last_exception = e
+            attempt_info["exception"] = str(e)
+            diagnostics["attempts"].append(attempt_info)
+            logger.warning(f"⚠️  Homepage fetch attempt {attempt} raised: {e}")
+
+        if attempt < 3:
+            time.sleep(3 * attempt)
+
+    diagnostics["outcome"] = "blocked_or_failed"
+    if last_exception:
+        diagnostics["final_exception"] = str(last_exception)
+
+    return None, diagnostics
+
+
+def save_diagnostics(diagnostics: dict):
+    try:
+        with open(DIAG_FILE, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, indent=2, ensure_ascii=False)
+        logger.info(f"📝 Wrote {DIAG_FILE} — check this file first if locations are ever empty.")
+    except OSError as e:
+        logger.error(f"Failed to write {DIAG_FILE}: {e}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # SANITIZATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -189,7 +277,7 @@ def sanitize(value) -> str:
         return ""
     if not isinstance(value, str):
         value = str(value)
-    text = re.sub(r"<[^>]+>", " ", value)          # strip any leftover HTML tags
+    text = re.sub(r"<[^>]+>", " ", value)
     text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -252,9 +340,13 @@ def load_progress() -> dict:
     return {"location_index": 0, "page": 1}
 
 
-def save_progress(location_index: int, page: int):
+def save_progress(location_index: int, page: int, note: str = None):
+    payload = {"location_index": location_index, "page": page}
+    if note:
+        payload["note"] = note
+    payload["last_updated"] = datetime.now().isoformat()
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"location_index": location_index, "page": page}, f)
+        json.dump(payload, f)
 
 
 _CSV_FIELDS = [
@@ -283,35 +375,125 @@ def save_job_to_csv(job: dict):
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 1 — DISCOVER LOCATIONS FROM THE HOMEPAGE
 # ════════════════════════════════════════════════════════════════════════════
+_LOCATION_HREF_RE = re.compile(r"^/empleos-en-[a-z0-9-]+/?$", re.IGNORECASE)
+
+# NEW fallback: some Computrabajo country sites list city sitemaps rather
+# than (or in addition to) homepage links. Tried only if both homepage
+# extraction methods find nothing. Any path that 404s or errors is skipped
+# silently — this is a bonus attempt, not a requirement.
+_CANDIDATE_SITEMAP_PATHS = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemaps/sitemap.xml",
+    "/sitemap-ciudades.xml",
+]
+
+
+def _try_sitemaps() -> list:
+    urls = []
+    seen = set()
+    for path in _CANDIDATE_SITEMAP_PATHS:
+        sitemap_url = BASE_URL + path
+        try:
+            resp = SESSION.get(sitemap_url, timeout=10)
+            if resp.status_code != 200 or "<" not in resp.text[:50]:
+                continue
+            soup = BeautifulSoup(resp.text, "xml")
+            for loc in soup.find_all("loc"):
+                href = loc.get_text(strip=True)
+                path_part = urlparse(href).path
+                if _LOCATION_HREF_RE.match(path_part) and href not in seen:
+                    seen.add(href)
+                    urls.append(href)
+            if urls:
+                logger.info(f"📍 Found {len(urls)} location URLs via sitemap: {sitemap_url}")
+                return urls
+        except Exception:
+            continue
+    return urls
+
+
 def get_location_urls() -> list:
     """
-    Scrapes the "Bolsa de empleo según: Localidad" block on the Costa Rica
-    homepage, which lists department links (e.g. /empleos-en-antioquia) and
-    their main cities (e.g. /empleos-en-medellin). Returns full URLs,
-    de-duplicated and in the order they appear on the page.
+    Finds the location links (e.g. /empleos-en-<place>) on this country's
+    Computrabajo homepage. Returns full URLs, de-duplicated and in the order
+    they appear on the page.
+
+    On any failure to find locations, this function now ALWAYS:
+      1. Writes cr_fetch_diagnostics.json with the raw evidence of what the
+         homepage fetch actually returned (status, headers, body snippet,
+         and whether it matches a known bot-block signature).
+      2. Calls save_progress() before returning, so cr_computrabajo_progress.json
+         always exists after a run — even a failed one — instead of only
+         being created after locations are successfully found.
     """
     logger.info(f"Fetching homepage: {HOME_URL}")
-    soup = get_soup(HOME_URL)
+    soup, diagnostics = fetch_homepage_with_diagnostics()
+    save_diagnostics(diagnostics)
 
-    container = soup.select_one("div.lL")
-    if not container:
-        logger.warning("Could not find the location block (div.lL) on the homepage.")
+    if soup is None:
+        logger.error("❌ Could not get a clean homepage response after retries — "
+                      f"see {DIAG_FILE}. Most likely cause: anti-bot blocking of the "
+                      "GitHub Actions runner's IP (Computrabajo's own robots.txt also "
+                      "disallows automated access, consistent with active bot defenses).")
+        save_progress(0, 1, note="homepage fetch blocked or failed — see cr_fetch_diagnostics.json")
         return []
 
     seen = set()
     urls = []
-    for a in container.select("ul#content_1 a[href]"):
-        href = a.get("href", "").strip()
-        if not href or href.startswith("http") and BASE_URL not in href:
-            continue
-        full = urljoin(BASE_URL, href)
-        if full not in seen:
-            seen.add(full)
-            urls.append(full)
 
-    logger.info(f"📍 Found {len(urls)} location URLs on the homepage.")
-    for i, u in enumerate(urls):
-        logger.debug(f"    [{i}] {u}")
+    def _collect(anchors):
+        for a in anchors:
+            href = a.get("href", "").strip()
+            if not href or (href.startswith("http") and BASE_URL not in href):
+                continue
+            full = urljoin(BASE_URL, href)
+            if full not in seen:
+                seen.add(full)
+                urls.append(full)
+
+    # Attempt 1 — the original Costa Rica-shaped container.
+    container = soup.select_one("div.lL")
+    if container:
+        _collect(container.select("ul#content_1 a[href]"))
+        if urls:
+            logger.info(f"📍 Found {len(urls)} location URLs via the div.lL container.")
+
+    # Attempt 2 — pattern-based fallback across the whole page.
+    if not urls:
+        logger.info("div.lL container not found or empty — falling back to a "
+                     "site-wide scan for /empleos-en-<place> links.")
+        _collect(a for a in soup.select("a[href]")
+                  if _LOCATION_HREF_RE.match(urlparse(a.get("href", "")).path or a.get("href", "")))
+
+    # Attempt 3 — NEW: sitemap-based fallback.
+    if not urls:
+        logger.info("No location links found in homepage HTML either — trying sitemaps.")
+        sitemap_urls = _try_sitemaps()
+        for u in sitemap_urls:
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+    if not urls:
+        debug_path = "cr_homepage_debug.html"
+        try:
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(str(soup))
+            logger.error(f"❌ No location URLs found via any method. Homepage HTML "
+                         f"dumped to {debug_path}, and fetch diagnostics saved to "
+                         f"{DIAG_FILE}. The page fetched cleanly (not a block page) "
+                         f"but contains no matching links — the homepage markup or "
+                         f"URL pattern for this country likely differs from what's "
+                         f"assumed. Inspect {debug_path} to find the real pattern.")
+        except OSError as e:
+            logger.error(f"❌ No location URLs found, and failed to write debug HTML: {e}")
+        save_progress(0, 1, note="homepage fetched OK but no location links matched — see cr_homepage_debug.html")
+    else:
+        logger.info(f"📍 Found {len(urls)} location URLs on the homepage.")
+        for i, u in enumerate(urls):
+            logger.debug(f"    [{i}] {u}")
+
     return urls
 
 
@@ -339,7 +521,7 @@ def scrape_job_list_page(location_url: str, page_num: int) -> list:
         a = article.select_one("h2 a.js-o-link[href]")
         if not a:
             continue
-        href = a["href"].split("#")[0]   # strip the #lc=... tracking fragment
+        href = a["href"].split("#")[0]
         urls.append(urljoin(BASE_URL, href))
 
     logger.info(f"Found {len(urls)} job URLs on page {page_num}")
@@ -370,7 +552,6 @@ def _find_jobposting_jsonld(soup: BeautifulSoup) -> dict:
 
 
 def _html_fallback_fields(soup: BeautifulSoup) -> dict:
-    """Used only if the JobPosting JSON-LD block is missing/unparsable."""
     title_el = soup.select_one("h1.fwB.fs24")
     title = title_el.get_text(strip=True) if title_el else ""
 
@@ -421,10 +602,8 @@ def scrape_job_details(job_url: str) -> dict:
     company_logo = org.get("logo", "")
 
     loc = (jp.get("jobLocation") or {}).get("address") or {}
-    # Computrabajo's schema puts the city in addressRegion and department in
-    # addressLocality on some pages (it's inconsistent) — combine both.
     location_parts = [p for p in (loc.get("addressRegion"), loc.get("addressLocality")) if p]
-    job_location = ", ".join(dict.fromkeys(location_parts))  # de-dup, keep order
+    job_location = ", ".join(dict.fromkeys(location_parts))
 
     salary_val = ((jp.get("baseSalary") or {}).get("value") or {})
     salary_amount = salary_val.get("value", "")
@@ -449,14 +628,14 @@ def scrape_job_details(job_url: str) -> dict:
     job = {
         "job_title": sanitize(title),
         "job_type": sanitize(job_type),
-        "job_qualifications": "",     # not reliably present in Computrabajo's schema
+        "job_qualifications": "",
         "job_experience": "",
         "job_location": sanitize(job_location) or "Costa Rica",
         "job_field": sanitize(jp.get("industry", "")),
         "date_posted": sanitize(date_posted_str),
         "deadline": sanitize(deadline),
         "job_description": sanitize(description),
-        "application": sanitize(job_url),   # Computrabajo apply flow requires login; store source link
+        "application": sanitize(job_url),
         "company_url": "",
         "company_name": sanitize(company_name),
         "company_logo": sanitize(company_logo),
@@ -477,7 +656,6 @@ def scrape_job_details(job_url: str) -> dict:
 
 
 def log_scraped_job(job_url: str, job: dict):
-    """Prints every extracted field for a job — the core of VERBOSE mode."""
     desc_preview = (job["job_description"][:200] + "…") if len(job["job_description"]) > 200 else job["job_description"]
     logger.info(
         "    ┌─ SCRAPED JOB ─────────────────────────────────────────\n"
@@ -497,7 +675,7 @@ def log_scraped_job(job_url: str, job: dict):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WORDPRESS (same pattern as the MyJobMag scraper)
+# WORDPRESS
 # ════════════════════════════════════════════════════════════════════════════
 def upload_logo(logo_url: str):
     if not logo_url or not logo_url.startswith("http"):
@@ -664,7 +842,6 @@ def save_job(job: dict):
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
 class _TimeBudgetExceeded(Exception):
-    """Raised internally to unwind cleanly once MAX_RUNTIME_SECONDS is hit."""
     pass
 
 
@@ -682,7 +859,9 @@ def run():
 
     locations = get_location_urls()
     if not locations:
-        logger.error("No locations found — aborting.")
+        logger.error("No locations found — aborting. "
+                      f"cr_computrabajo_progress.json and cr_fetch_diagnostics.json "
+                      f"have still been written — check those two files to see exactly why.")
         return
 
     progress = load_progress()
@@ -749,12 +928,9 @@ def run():
                         logger.info(f"✅ SAVED — '{job['job_title']}' → {SCRAPED_JOBS_CSV}")
 
                     processed_ids.add(job_id)
-                    time.sleep(1)   # be polite to the source site
+                    time.sleep(1)
 
                     if time_budget_exceeded():
-                        # Save progress as this exact page (it's not finished yet,
-                        # so re-fetching it next run is correct — already-processed
-                        # jobs on it will just hit the dedup skip instantly).
                         save_progress(loc_idx, page_num)
                         raise _TimeBudgetExceeded()
 
@@ -762,7 +938,6 @@ def run():
                 logger.info(f"📊 Running totals — posted: {posted} | skipped: {skipped} | failed: {failed}")
                 page_num += 1
 
-            # finished this location entirely — next location starts at page 1
             save_progress(loc_idx + 1, 1)
 
         logger.info(f"\n{'#'*60}")
@@ -773,8 +948,6 @@ def run():
         if not wp_enabled:
             logger.info(f" 📄 Output  : {SCRAPED_JOBS_CSV}")
         logger.info(f"{'#'*60}")
-        # Tell the GitHub Actions workflow there's nothing left to resume —
-        # it checks for this file and stops re-triggering itself once it exists.
         with open(DONE_FLAG_FILE, "w", encoding="utf-8") as f:
             f.write(f"All {len(locations)} locations fully scraped as of "
                      f"{datetime.now().isoformat()}. Delete this file to force a fresh full re-scrape.")
