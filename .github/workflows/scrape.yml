@@ -1,4 +1,4 @@
-name: Computrabajo Colombia Scraper
+name: Computrabajo Costa Rica Scraper
 
 on:
   workflow_dispatch: {}        # lets you trigger a run manually from the Actions tab
@@ -9,16 +9,21 @@ on:
     # instant the current one ends, giving you continuous back-to-back runs
     # without needing a self-retriggering token. Once every location has
     # been scraped, the script exits almost instantly (it sees
-    # SCRAPE_COMPLETE.flag and returns), so these scheduled ticks become a
-    # harmless no-op that costs a few seconds of Actions minutes.
+    # cr_SCRAPE_COMPLETE.flag and returns), so these scheduled ticks
+    # become a harmless no-op that costs a few seconds of Actions minutes.
     - cron: "*/15 * * * *"
 
 concurrency:
-  group: computrabajo-scraper
+  # This MUST be unique per country. If every country workflow shared
+  # the group name "computrabajo-scraper", GitHub Actions would treat all
+  # country scrapers as ONE queue — only one country's run could ever be
+  # in progress at a time, and the others would queue behind it indefinitely
+  # instead of running in parallel.
+  group: computrabajo-scraper-cr
   cancel-in-progress: false    # never kill a run in progress — queue behind it instead
 
 permissions:
-  contents: write               # needed to commit processed.csv / progress.json back to the repo
+  contents: write               # needed to commit cr_processed.csv / cr_computrabajo_progress.json back to the repo
 
 jobs:
   scrape:
@@ -55,12 +60,34 @@ jobs:
           MAX_RUNTIME_SECONDS: "20000"
         run: python computrabajo_cr_scraper.py
 
+      # ── UPDATED ──────────────────────────────────────────────────────────
+      # Now also commits cr_fetch_diagnostics.json, the new file the script
+      # writes every time it fetches (or fails to fetch) the homepage. This
+      # is the file to check first if locations are ever empty again — it
+      # records the exact HTTP status, response headers, and a body snippet,
+      # and flags whether the response looks like a Cloudflare/bot-challenge
+      # page rather than the real site.
       - name: Commit progress back to the repo
         if: always()   # commit whatever progress was made even if the run errored out
         run: |
           git config user.name "computrabajo-scraper-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add -A -- processed.csv computrabajo_progress.json scraped_jobs.csv debug.log SCRAPE_COMPLETE.flag
+
+          files=()
+          for f in cr_processed.csv cr_computrabajo_progress.json cr_scraped_jobs.csv cr_debug.log cr_SCRAPE_COMPLETE.flag cr_homepage_debug.html cr_fetch_diagnostics.json; do
+            if [ -f "$f" ]; then
+              files+=("$f")
+            else
+              echo "ℹ️  $f not present this run — skipping."
+            fi
+          done
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "⚠️  None of the expected output files exist — the scraper likely failed before writing anything. Check the 'Run scraper' step logs."
+            exit 0
+          fi
+
+          git add -A -- "${files[@]}"
           if git diff --cached --quiet; then
             echo "No progress changes to commit."
           else
@@ -72,10 +99,14 @@ jobs:
       - name: Report status
         if: always()
         run: |
-          if [ -f SCRAPE_COMPLETE.flag ]; then
+          if [ -f cr_SCRAPE_COMPLETE.flag ]; then
             echo "✅ All locations fully scraped. Future scheduled runs will exit instantly until the flag file is deleted."
-            cat SCRAPE_COMPLETE.flag
+            cat cr_SCRAPE_COMPLETE.flag
+          elif [ -f cr_fetch_diagnostics.json ] && grep -q '"outcome": "blocked_or_failed"' cr_fetch_diagnostics.json; then
+            echo "🚫 Homepage fetch looked blocked/failed — check cr_fetch_diagnostics.json for the exact status code, headers and body snippet."
+          elif [ -f cr_homepage_debug.html ]; then
+            echo "🐛 Homepage fetched OK but no location links matched — cr_homepage_debug.html was committed for inspection."
           else
             echo "⏱ Time budget reached (or run ended) before finishing all locations."
-            echo "The next scheduled run (within ~15 min) will resume automatically from computrabajo_progress.json."
+            echo "The next scheduled run (within ~15 min) will resume automatically from cr_computrabajo_progress.json."
           fi
