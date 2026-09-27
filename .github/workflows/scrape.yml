@@ -47,12 +47,13 @@ jobs:
           WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          INTERNAL_BOT_KEY: ${{ secrets.INTERNAL_BOT_KEY }}
           # 20000s = ~5h33m. Leaves ~15+ min of headroom inside the 350-min
           # job timeout for checkout/setup/install (~1-2 min) and the commit
           # step below, so the script always has time to save progress and
           # exit cleanly on its own before GitHub would kill it mid-request.
           MAX_RUNTIME_SECONDS: "20000"
-        run: python computrabajo_co_scraper.py
+        run: python computrabajo_cr_scraper.py
 
       - name: Commit progress back to the repo
         if: always()   # commit whatever progress was made even if the run errored out
