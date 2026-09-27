@@ -1,3 +1,23 @@
+#!/usr/bin/env python3
+"""
+Computrabajo Costa Rica (cr.computrabajo.com) job scraper.
+
+Strategy:
+  1. Scrape the homepage's "Job bank according to: Location" block to get a
+     list of department + city search URLs (e.g. /empleos-en-medellin).
+  2. For each location, paginate the search-results grid (?p=2, ?p=3, ...)
+     collecting job detail URLs, stopping when a page returns zero jobs.
+  3. For each job detail page, read the embedded JSON-LD <script
+     type="application/ld+json"> block with "@type": "JobPosting" — this is
+     Computrabajo's own structured data and is far more stable than scraping
+     minified CSS classes. Falls back to raw HTML parsing if JSON-LD is
+     missing or malformed.
+  4. Posts each job (and its company) to WordPress, exactly like the
+     MyJobMag scraper: dedup via processed.csv, resumable via a progress
+     file, one WP round-trip per unique taxonomy term per run.
+
+Run this directly in Colab or locally with: python computrabajo_co_scraper.py
+"""
 import os
 import re
 import csv
@@ -68,6 +88,15 @@ WP_JOBS_URL    = f"{WP_BASE}/job-listings"
 WP_COMPANY_URL = f"{WP_BASE}/companies"
 WP_MEDIA_URL   = f"{WP_BASE}/media"
 
+# FIX: this script previously had NO X-Internal-Auth support at all — every
+# request it made to WordPress went out without the header your Cloudflare
+# rule checks for, same gap that was fixed on the Nigeria/Ghana and
+# Computrabajo Colombia scrapers. Loaded as an *optional* env var (never
+# raises) so the script still runs — just loudly warns — until the secret
+# is added to this repo too.
+_LOCAL_INTERNAL_BOT_KEY = ""   # optional local override, same pattern as the WP_* vars above
+INTERNAL_BOT_KEY = _LOCAL_INTERNAL_BOT_KEY or os.environ.get("INTERNAL_BOT_KEY", "").strip()
+
 JOB_TYPE_MAPPING = {
     "full_time": "full-time", "full-time": "full-time", "fulltime": "full-time",
     "part_time": "part-time", "part-time": "part-time", "parttime": "part-time",
@@ -100,6 +129,15 @@ _ch.setLevel(logging.DEBUG if VERBOSE else logging.INFO)
 _ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(_ch)
 
+if INTERNAL_BOT_KEY:
+    logger.info(f"[STARTUP CHECK] INTERNAL_BOT_KEY is SET (length={len(INTERNAL_BOT_KEY)}) "
+                f"— X-Internal-Auth header WILL be sent on every WordPress request.")
+else:
+    logger.warning("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING "
+                    "— X-Internal-Auth header will NOT be sent. Add it as a GitHub "
+                    "Actions secret for THIS repo if you rely on it to bypass a "
+                    "Cloudflare WAF/rate-limit rule.")
+
 
 def require_wp_config() -> bool:
     """Returns True if WP posting is fully configured, False otherwise.
@@ -126,8 +164,14 @@ SESSION.headers.update(HEADERS)
 
 
 def wp_headers() -> dict:
+    # FIX: previously this returned only Authorization + Content-Type, with
+    # no X-Internal-Auth header at all — so this script's traffic could never
+    # be recognised as "trusted" by any Cloudflare rule checking for it.
     token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    if INTERNAL_BOT_KEY:
+        headers["X-Internal-Auth"] = INTERNAL_BOT_KEY
+    return headers
 
 
 def get_soup(url: str, timeout: int = REQUEST_TIMEOUT) -> BeautifulSoup:
