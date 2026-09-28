@@ -5,7 +5,7 @@
       "attempt": 1,
       "status_code": 200,
       "response_headers": {
-        "Date": "Sun, 27 Sep 2026 17:05:16 GMT",
+        "Date": "Mon, 28 Sep 2026 03:16:12 GMT",
         "Content-Type": "text/html; charset=utf-8",
         "Transfer-Encoding": "chunked",
         "Connection": "keep-alive",
@@ -13,7 +13,7 @@
         "Content-Encoding": "gzip",
         "Vary": "*"
       },
-      "body_length": 114682,
+      "body_length": 114681,
       "body_snippet": "<!DOCTYPE html>\r\n<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"es-CR\">\r\n<head>\r\n    \r\n    <title>Bolsa de empleo en Costa Rica | Ofertas de empleo Computrabajo</title>\r\n\r\n    <meta name=\"title\" content=\"Bolsa de empleo en Costa Rica | Ofertas de empleo Computrabajo\" />\r\n    <meta name=\"description\" content=\"Encuentra ofertas de empleo en la bolsa de empleo de Computrabajo Costa Rica. Registra tu CV y post&#xFA;late gratis a vacantes actualizadas hoy.\" />\r\n    <meta name=\"author\" content=\"Computrabajo Costa Rica\" />\r\n    <meta property=\"og:title\" content=\"Bolsa de empleo en Costa Rica | Ofertas de empleo Computrabajo\" />\r\n    <meta property=\"og:description\" content=\"Encuentra ofertas de empleo en la bolsa de empleo de Computrabajo Costa Rica. Registra tu CV y post&#xFA;late gratis a vacantes actualizadas hoy.\" />\r\n    <meta property=\"og:site_name\" content=\"Computrabajo Costa Rica\" />\r\n    <meta property=\"og:type\" content=\"website\" />\r\n    <meta property=\"og:image\" content=\"//cp.ct-st",
       "block_signature_matched": null,
       "final_url_after_redirects": "https://cr.computrabajo.com/"
