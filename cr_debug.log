@@ -52335,3 +52335,7 @@ Ejecutar de manera segura, eficiente y puntual la distribución de productos Pol
 2026-10-02 01:48:36,137 INFO 🚀 Computrabajo Costa Rica scraper — starting… (Ctrl+C to stop, safe to resume)
 2026-10-02 01:48:36,137 INFO 🏁 cr_SCRAPE_COMPLETE.flag already exists — all locations were fully scraped on a previous run. Delete this file if you want to force a fresh full re-scrape.
 2026-10-02 01:48:36,137 INFO ✅ Done.
+2026-10-02 10:43:18,424 INFO [STARTUP CHECK] INTERNAL_BOT_KEY is SET (length=64) — X-Internal-Auth header WILL be sent on every WordPress request.
+2026-10-02 10:43:18,424 INFO 🚀 Computrabajo Costa Rica scraper — starting… (Ctrl+C to stop, safe to resume)
+2026-10-02 10:43:18,424 INFO 🏁 cr_SCRAPE_COMPLETE.flag already exists — all locations were fully scraped on a previous run. Delete this file if you want to force a fresh full re-scrape.
+2026-10-02 10:43:18,425 INFO ✅ Done.
